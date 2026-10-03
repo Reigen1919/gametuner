@@ -1,0 +1,582 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Buat proyek
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GameTuner"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.gametuner"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.gametuner"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <queries>
+                  <package android:name="com.dts.freefireth" />
+                  <package android:name="com.dts.freefiremax" />
+              </queries>
+              <application android:label="Game Tuner" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+                  <service android:name=".CrosshairService" android:exported="false" />
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="density|screenSize|smallestScreenSize|screenLayout|orientation|keyboardHidden|fontScale|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/gametuner
+          cat > app/src/main/java/com/example/gametuner/Sh.kt <<'EOF_FILE'
+          package com.example.gametuner
+
+          import rikka.shizuku.Shizuku
+
+          /** Menjalankan perintah shell lewat Shizuku (hak akses shell/adb). */
+          object Sh {
+              fun ready() = try { Shizuku.pingBinder() && Shizuku.checkSelfPermission() == 0 } catch (e: Throwable) { false }
+
+              fun run(cmd: String): String = try {
+                  // newProcess bersifat private di Shizuku 13.x, dipanggil via reflection
+                  val m = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
+                  m.isAccessible = true
+                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+                  p.waitFor(); out.trim()
+              } catch (e: Throwable) { "error: ${e.message}" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/gametuner
+          cat > app/src/main/java/com/example/gametuner/CrosshairView.kt <<'EOF_FILE'
+          package com.example.gametuner
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.View
+
+          /** Menggambar crosshair di tengah view, membaca pengaturan dari SharedPreferences "cfg". */
+          class CrosshairView(c: Context) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val colors = intArrayOf(Color.RED, Color.GREEN, Color.WHITE, Color.CYAN, Color.YELLOW, Color.MAGENTA)
+
+              override fun onDraw(cv: Canvas) {
+                  val sp = context.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+                  val d = resources.displayMetrics.density
+                  val size = sp.getInt("ch_size", 14) * d
+                  val th = sp.getInt("ch_thick", 2) * d
+                  p.color = colors[sp.getInt("ch_color", 0).coerceIn(0, colors.size - 1)]
+                  p.alpha = sp.getInt("ch_alpha", 100) * 255 / 100
+                  p.strokeWidth = th
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  when (sp.getInt("ch_style", 1)) {
+                      0 -> { p.style = Paint.Style.FILL; cv.drawCircle(cx, cy, th * 1.5f, p) }
+                      1 -> { p.style = Paint.Style.FILL
+                          cv.drawLine(cx - size, cy, cx + size, cy, p); cv.drawLine(cx, cy - size, cx, cy + size, p) }
+                      2 -> { p.style = Paint.Style.STROKE; cv.drawCircle(cx, cy, size, p)
+                          p.style = Paint.Style.FILL; cv.drawCircle(cx, cy, th, p) }
+                      else -> { p.style = Paint.Style.FILL
+                          cv.drawLine(cx - size, cy - size, cx + size, cy + size, p); cv.drawLine(cx - size, cy + size, cx + size, cy - size, p) }
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/gametuner
+          cat > app/src/main/java/com/example/gametuner/CrosshairService.kt <<'EOF_FILE'
+          package com.example.gametuner
+
+          import android.app.Service
+          import android.content.Intent
+          import android.graphics.PixelFormat
+          import android.os.IBinder
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.WindowManager
+
+          /** Menampilkan crosshair di atas semua aplikasi. Sentuhan diteruskan ke aplikasi di bawahnya. */
+          class CrosshairService : Service() {
+              private var view: CrosshairView? = null
+              private lateinit var wm: WindowManager
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+                  if (!Settings.canDrawOverlays(this) || !sp.getBoolean("ch_on", false)) { stopSelf(); return START_NOT_STICKY }
+                  val d = resources.displayMetrics.density
+                  val s = (((sp.getInt("ch_size", 14) + sp.getInt("ch_thick", 2)) * 2 + 8) * d).toInt()
+                  val lp = WindowManager.LayoutParams(
+                      s, s, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.CENTER
+                      x = (sp.getInt("ch_x", 0) * d).toInt()
+                      y = (sp.getInt("ch_y", 0) * d).toInt()
+                  }
+                  val v = view
+                  if (v == null) view = CrosshairView(this).also { wm.addView(it, lp) }
+                  else { wm.updateViewLayout(v, lp); v.invalidate() }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  if (::wm.isInitialized) view?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  view = null
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/gametuner
+          cat > app/src/main/java/com/example/gametuner/MainActivity.kt <<'EOF_FILE'
+          package com.example.gametuner
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.BatteryManager
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.StatFs
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+
+          private val BG = Color.parseColor("#14141C")
+          private val CARD = Color.parseColor("#1F1F2C")
+          private val CARD2 = Color.parseColor("#2C2C40")
+          private val ACC = Color.parseColor("#9A94F0")
+          private val OK = Color.parseColor("#7BE08F")
+          private val BAD = Color.parseColor("#E5575B")
+          private val TX = Color.parseColor("#ECEBF6")
+          private val MUT = Color.parseColor("#8D8CA5")
+          private val FF = listOf("com.dts.freefireth", "com.dts.freefiremax")
+
+          class Stage(val name: String, val steps: List<Pair<String, String>>)
+
+          class MainActivity : Activity() {
+              private val ui = Handler(Looper.getMainLooper())
+              private var ticker: Runnable? = null
+              private var screen = "home"
+              private lateinit var titleView: TextView
+              private lateinit var status: TextView
+              private lateinit var tRam: TextView; private lateinit var sRam: TextView
+              private lateinit var tBat: TextView; private lateinit var sBat: TextView
+              private lateinit var tSto: TextView; private lateinit var sSto: TextView
+              private lateinit var tScore: TextView; private lateinit var sScore: TextView
+
+              // Pengaturan yang disimpan nilai aslinya, dipakai oleh tombol Pulihkan
+              private val keys = listOf(
+                  "global window_animation_scale", "global transition_animation_scale", "global animator_duration_scale",
+                  "secure long_press_timeout", "secure multi_press_timeout", "secure high_touch_sensitivity_enable",
+                  "system min_refresh_rate", "system peak_refresh_rate")
+
+              private fun stages() = listOf(
+                  Stage("Graphics", listOf(
+                      "animasi jendela 0.5x" to "settings put global window_animation_scale 0.5",
+                      "animasi transisi 0.5x" to "settings put global transition_animation_scale 0.5",
+                      "durasi animator 0.5x" to "settings put global animator_duration_scale 0.5",
+                      "kunci refresh rate {HZ} Hz" to "settings put system min_refresh_rate {HZ}; settings put system peak_refresh_rate {HZ}")),
+                  Stage("Power", listOf(
+                      "mode performa tetap" to "cmd power set-fixed-performance-mode-enabled true",
+                      "matikan penghemat baterai" to "settings put global low_power 0",
+                      "matikan doze" to "dumpsys deviceidle disable")),
+                  Stage("Display", listOf(
+                      "long-press 250 ms" to "settings put secure long_press_timeout 250",
+                      "multi-press 200 ms" to "settings put secure multi_press_timeout 200",
+                      "sentuhan sensitif tinggi (jika didukung)" to "settings put secure high_touch_sensitivity_enable 1")),
+                  Stage("Network", listOf(
+                      "wifi low-latency" to "cmd wifi force-low-latency-mode enabled",
+                      "izinkan data background" to "cmd netpolicy set restrict-background false")),
+                  Stage("Bloat", listOf(
+                      "bersihkan cache aplikasi" to "pm trim-caches 4G",
+                      "tutup proses background" to "am kill-all")),
+                  Stage("Game", listOf(
+                      "game mode performance (Free Fire)" to FF.joinToString("; ") { "cmd game mode performance $it" },
+                      "jangan ganggu aktif" to "cmd notification set_dnd priority")))
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  try { Shizuku.addRequestPermissionResultListener { _, _ -> ui.post { if (screen == "home") tick() } } } catch (_: Throwable) {}
+                  home()
+              }
+
+              override fun onBackPressed() { if (screen == "home") super.onBackPressed() else home() }
+
+              // ---------- helper UI ----------
+              private fun prefs(): SharedPreferences = getSharedPreferences("cfg", MODE_PRIVATE)
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+              private fun bg(c: Int, r: Int = 20) = GradientDrawable().apply { setColor(c); cornerRadius = dp(r).toFloat() }
+              private fun tv(t: String, s: Float = 14f, c: Int = TX, bold: Boolean = false) =
+                  TextView(this).apply { text = t; textSize = s; setTextColor(c); if (bold) setTypeface(typeface, Typeface.BOLD) }
+              private fun box(vertical: Boolean = true, pad: Int = 16, color: Int = CARD) = LinearLayout(this).apply {
+                  orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+                  setPadding(dp(pad), dp(pad), dp(pad), dp(pad)); background = bg(color) }
+              private fun lp(w: Int = -1, h: Int = -2, top: Int = 0, wt: Float = 0f) =
+                  LinearLayout.LayoutParams(w, h, wt).apply { topMargin = dp(top) }
+              private fun button(t: String, color: Int = CARD2, f: () -> Unit) = Button(this).apply {
+                  text = t; isAllCaps = false; setTextColor(TX); background = bg(color, 16); setOnClickListener { f() } }
+              private fun row(vararg vs: View) = LinearLayout(this).apply {
+                  orientation = LinearLayout.HORIZONTAL
+                  vs.forEach { addView(it, lp(0, -2, 0, 1f).apply { leftMargin = dp(4); rightMargin = dp(4) }) } }
+              private fun tile(label: String, big: TextView, sub: TextView) =
+                  box().apply { addView(tv(label, 12f, MUT)); addView(big, lp(top = 6)); addView(sub, lp(top = 4)) }
+              private fun card(t: String, d: String, f: () -> Unit) =
+                  box(pad = 18).apply { addView(tv(t, 18f, bold = true)); addView(tv(d, 14f, MUT)); setOnClickListener { f() } }
+              private fun seek(max: Int, v: Int, f: (Int) -> Unit) = SeekBar(this).apply {
+                  this.max = max; progress = v
+                  setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { if (u) f(p) }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  }) }
+
+              private fun page(title: String, back: Boolean, body: LinearLayout.() -> Unit) {
+                  ticker?.let { ui.removeCallbacks(it) }
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(36), dp(16), dp(24)) }
+                  val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  if (back) head.addView(tv("←", 26f).apply { setPadding(0, 0, dp(14), 0); setOnClickListener { home() } })
+                  titleView = tv(title, 26f, bold = true)
+                  head.addView(titleView)
+                  root.addView(head)
+                  root.body()
+                  setContentView(ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; addView(root) })
+              }
+
+              // ---------- layar utama ----------
+              private fun home() {
+                  screen = "home"
+                  page("Game Tuner", false) {
+                      addView(tv("Android optimizer", 14f, MUT))
+                      status = tv("", 16f, OK)
+                      addView(box(false, 14, Color.parseColor("#1E3A28")).apply { addView(status) }, lp(top = 14))
+                      addView(button("Beri izin Shizuku") {
+                          try { Shizuku.requestPermission(1) } catch (e: Throwable) { toast("Aktifkan dulu lewat aplikasi Shizuku") } }, lp(top = 8))
+                      tRam = tv("-", 22f, bold = true); sRam = tv("", 12f, MUT)
+                      tBat = tv("-", 22f, bold = true); sBat = tv("", 12f, MUT)
+                      tSto = tv("-", 22f, bold = true); sSto = tv("", 12f, MUT)
+                      tScore = tv("-", 22f, bold = true); sScore = tv("", 12f, MUT)
+                      addView(row(tile("RAM", tRam, sRam), tile("Baterai", tBat, sBat)), lp(top = 12))
+                      addView(row(tile("Penyimpanan", tSto, sSto), tile("Skor terakhir", tScore, sScore)), lp(top = 12))
+                      addView(button("▶   Inject", ACC) { inject() }.apply { setTextColor(Color.BLACK); textSize = 20f }, lp(h = dp(66), top = 16))
+                      addView(button("⟲   Pulihkan  ·  kembalikan default") { restore() }, lp(top = 10))
+                      addView(row(card("Layar", "Resolusi & density") { displayScreen() }, card("Crosshair", "Overlay bidik") { crosshairScreen() }), lp(top = 10))
+                  }
+                  ticker = object : Runnable { override fun run() { tick(); ui.postDelayed(this, 2000) } }
+                  ui.post(ticker!!)
+              }
+
+              private fun memUsedPct(): Double {
+                  val mi = ActivityManager.MemoryInfo()
+                  (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+                  return 100.0 - mi.availMem * 100.0 / mi.totalMem
+              }
+              private fun battTemp(): Double {
+                  val b = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  return (b?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10.0
+              }
+              private fun score() = (100 - memUsedPct() * 0.3 - maxOf(0.0, battTemp() - 35.0) * 1.5).toInt().coerceIn(40, 99)
+
+              private fun tick() {
+                  val mi = ActivityManager.MemoryInfo()
+                  (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+                  tRam.text = "%.1fGB".format(mi.totalMem / 1e9)
+                  sRam.text = "%.1fGB terpakai".format((mi.totalMem - mi.availMem) / 1e9)
+                  val b = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val lvl = b?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0
+                  val sc = b?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+                  tBat.text = "${lvl * 100 / sc}%"; sBat.text = "%.1f°C".format(battTemp())
+                  val sf = StatFs(Environment.getDataDirectory().path)
+                  val tot = sf.totalBytes / 1e9; val used = tot - sf.availableBytes / 1e9
+                  tSto.text = "%.0fG".format(tot); sSto.text = "%.0f%% terpakai".format(used / tot * 100)
+                  val s = prefs().getInt("score", -1)
+                  tScore.text = if (s < 0) "-" else "$s/100"; sScore.text = if (s < 0) "belum ada" else "setelah inject terakhir"
+                  val ready = Sh.ready()
+                  status.text = if (ready) "●  Shizuku siap" else "○  Shizuku belum aktif / belum diberi izin"
+                  status.setTextColor(if (ready) OK else BAD)
+              }
+
+              // ---------- inject ----------
+              private fun maxHz(): String {
+                  val out = Sh.run("dumpsys display")
+                  val m = Regex("fps=([0-9]+(?:\\.[0-9]+)?)").findAll(out).mapNotNull { it.groupValues[1].toDoubleOrNull() }.maxOrNull() ?: 60.0
+                  return m.toInt().toString() + ".0"
+              }
+
+              private fun saveOriginals() {
+                  val p = prefs(); if (p.contains("saved")) return
+                  val e = p.edit(); keys.forEach { e.putString(it, Sh.run("settings get $it")) }; e.putBoolean("saved", true).apply()
+              }
+
+              private fun openFF() {
+                  val i = FF.mapNotNull { packageManager.getLaunchIntentForPackage(it) }.firstOrNull()
+                  if (i != null) startActivity(i) else toast("Free Fire tidak ditemukan")
+              }
+
+              private fun inject() {
+                  if (!Sh.ready()) { toast("Shizuku belum aktif / belum diberi izin"); return }
+                  screen = "inject"
+                  val st = stages()
+                  val total = st.sumOf { it.steps.size }
+                  val icons = ArrayList<TextView>(); val subs = ArrayList<TextView>(); val logs = ArrayList<TextView>()
+                  var holder: LinearLayout? = null
+                  val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
+                  val pct = tv("0%", 13f, MUT)
+                  page("Menjalankan (1/${st.size})", true) {
+                      holder = this
+                      addView(bar, lp(top = 16)); addView(pct, lp(top = 4))
+                      st.forEach { s ->
+                          val ic = tv("○", 24f, MUT); val sub = tv("Siap", 13f, MUT)
+                          val lg = tv("", 12f, OK).apply { visibility = View.GONE }
+                          icons.add(ic); subs.add(sub); logs.add(lg)
+                          val head = LinearLayout(this@MainActivity).apply {
+                              orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                              addView(ic, lp(dp(36), -2))
+                              addView(LinearLayout(this@MainActivity).apply {
+                                  orientation = LinearLayout.VERTICAL; addView(tv(s.name, 17f, bold = true)); addView(sub) })
+                          }
+                          addView(box().apply { addView(head); addView(lg, lp(top = 8)) }, lp(top = 10))
+                      }
+                  }
+                  Thread {
+                      saveOriginals()
+                      val hz = maxHz()
+                      var done = 0
+                      st.forEachIndexed { i, s ->
+                          runOnUiThread { titleView.text = "Menjalankan (${i + 1}/${st.size})"
+                              icons[i].text = "◐"; icons[i].setTextColor(ACC); subs[i].text = "Berjalan"; logs[i].visibility = View.VISIBLE }
+                          s.steps.forEach { (msg, cmd) ->
+                              runOnUiThread { logs[i].append("> ${msg.replace("{HZ}", hz)}\n") }
+                              Sh.run(cmd.replace("{HZ}", hz))
+                              done++
+                              val p = done * 100 / total
+                              runOnUiThread { bar.progress = p; pct.text = "$p%" }
+                              Thread.sleep(350)
+                          }
+                          runOnUiThread { icons[i].text = "✓"; icons[i].setTextColor(OK); subs[i].text = "Selesai" }
+                      }
+                      val sc = score(); prefs().edit().putInt("score", sc).apply()
+                      runOnUiThread {
+                          titleView.text = "Selesai · skor $sc/100"
+                          holder?.addView(button("Buka Free Fire", ACC) { openFF() }.apply { setTextColor(Color.BLACK) }, lp(top = 14))
+                      }
+                  }.start()
+              }
+
+              private fun restore() {
+                  if (!Sh.ready()) { toast("Shizuku belum aktif / belum diberi izin"); return }
+                  Thread {
+                      keys.forEach { k ->
+                          val v = prefs().getString(k, null)
+                          if (v == null || v == "null" || v.startsWith("error")) Sh.run("settings delete $k") else Sh.run("settings put $k $v")
+                      }
+                      listOf("cmd power set-fixed-performance-mode-enabled false", "dumpsys deviceidle enable",
+                          "cmd wifi force-low-latency-mode disabled", "cmd notification set_dnd off",
+                          "wm size reset", "wm density reset").forEach { Sh.run(it) }
+                      FF.forEach { Sh.run("cmd game reset $it") }
+                      prefs().edit().remove("saved").putInt("score", -1).apply()
+                      toast("Semua pengaturan dikembalikan ke default")
+                  }.start()
+              }
+
+              // ---------- layar / resolusi ----------
+              private fun displayScreen() {
+                  if (!Sh.ready()) { toast("Shizuku belum aktif / belum diberi izin"); return }
+                  Thread {
+                      val raw = Sh.run("wm size")
+                      val rawD = Sh.run("wm density")
+                      val sz = Regex("Physical size: (\\d+)x(\\d+)").find(raw)
+                      val w = sz?.groupValues?.get(1)?.toInt() ?: 1080
+                      val hgt = sz?.groupValues?.get(2)?.toInt() ?: 2400
+                      val d = Regex("Physical density: (\\d+)").find(rawD)?.groupValues?.get(1)?.toInt() ?: 420
+                      val ov = Regex("Override size: (\\d+)x(\\d+)").find(raw)
+                      val cw = ov?.groupValues?.get(1)?.toInt() ?: w
+                      val ch = ov?.groupValues?.get(2)?.toInt() ?: hgt
+                      val cd = Regex("Override density: (\\d+)").find(rawD)?.groupValues?.get(1)?.toInt() ?: d
+                      runOnUiThread { displayUi(w, hgt, d, raw.replace("\n", " · "), cw, ch, cd) }
+                  }.start()
+              }
+
+              private fun resetRes() = Thread { Sh.run("wm size reset"); Sh.run("wm density reset"); toast("Layar dikembalikan ke asli") }.start()
+
+              private fun confirmRes() {
+                  val dlg = AlertDialog.Builder(this).setTitle("Pertahankan pengaturan layar?")
+                      .setMessage("Kembali otomatis dalam 10 detik").setCancelable(false)
+                      .setPositiveButton("Pertahankan", null)
+                      .setNegativeButton("Kembalikan") { _, _ -> resetRes() }.create()
+                  dlg.show()
+                  var left = 10
+                  ui.postDelayed(object : Runnable {
+                      override fun run() {
+                          if (!dlg.isShowing) return
+                          left--
+                          if (left <= 0) { dlg.dismiss(); resetRes() }
+                          else { dlg.setMessage("Kembali otomatis dalam $left detik"); ui.postDelayed(this, 1000) }
+                      }
+                  }, 1000)
+              }
+
+              private fun displayUi(w: Int, hgt: Int, d: Int, cur: String, cw: Int, ch: Int, cd: Int) {
+                  screen = "display"
+                  page("Layar", true) {
+                      val ctx = this@MainActivity
+                      addView(tv("Saat ini: $cur", 12f, MUT), lp(top = 8))
+                      addView(tv("Fisik: ${w}x$hgt · $d dpi", 13f, MUT))
+                      fun field(v: Int) = EditText(ctx).apply {
+                          inputType = InputType.TYPE_CLASS_NUMBER; setText(v.toString()); setSelectAllOnFocus(true)
+                          setTextColor(TX); textSize = 18f; background = bg(CARD2, 12); setPadding(dp(12), dp(10), dp(12), dp(10)) }
+                      fun labeled(t: String, e: EditText) = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.VERTICAL; addView(tv(t, 12f, MUT)); addView(e, lp(top = 4)) }
+                      val eW = field(cw); val eH = field(ch); val eD = field(cd)
+                      addView(tv("Atur manual", 15f, bold = true), lp(top = 18))
+                      addView(row(labeled("Lebar (px)", eW), labeled("Tinggi (px)", eH)), lp(top = 8))
+                      addView(labeled("Density (dpi)", eD), lp(top = 10))
+                      addView(tv("Pakai rasio yang sama dengan layar asli supaya gambar tidak melar. Kalau layar jadi aneh, tunggu 10 detik dan akan kembali otomatis.", 12f, MUT), lp(top = 8))
+
+                      addView(tv("Atau pakai persentase", 15f, bold = true), lp(top = 20))
+                      fun even(x: Int) = x / 2 * 2
+                      lateinit var sb: SeekBar
+                      val info = tv("", 13f, MUT)
+                      fun upd() {
+                          val p = 50 + sb.progress
+                          info.text = "$p% dari ukuran asli"
+                          eW.setText(even(w * p / 100).toString()); eH.setText(even(hgt * p / 100).toString()); eD.setText((d * p / 100).toString())
+                      }
+                      sb = seek(50, (cw * 100 / w - 50).coerceIn(0, 50)) { upd() }
+                      info.text = "${50 + sb.progress}% dari ukuran asli"
+                      addView(info, lp(top = 6)); addView(sb, lp(top = 4))
+                      addView(row(*listOf(100, 90, 80, 70, 60).map { p -> button("$p%") { sb.progress = p - 50; upd() } }.toTypedArray()), lp(top = 10))
+
+                      addView(button("Terapkan", ACC) {
+                          val nw = eW.text.toString().toIntOrNull(); val nh = eH.text.toString().toIntOrNull(); val nd = eD.text.toString().toIntOrNull()
+                          if (nw == null || nh == null || nd == null || nw !in 300..10000 || nh !in 300..10000 || nd !in 72..1000) {
+                              toast("Isi lebar, tinggi, dan density dengan angka yang valid"); return@button
+                          }
+                          Thread {
+                              Sh.run("wm size ${nw}x$nh"); Sh.run("wm density $nd")
+                              runOnUiThread { confirmRes() }
+                          }.start()
+                      }.apply { setTextColor(Color.BLACK) }, lp(top = 18))
+                      addView(button("Reset ke resolusi asli", BAD) { resetRes() }, lp(top = 10))
+                  }
+              }
+
+              // ---------- crosshair ----------
+              private fun crosshairScreen() {
+                  screen = "crosshair"
+                  val p = prefs()
+                  page("Crosshair", true) {
+                      val ctx = this@MainActivity
+                      val pv = CrosshairView(ctx).apply { background = bg(Color.parseColor("#0E0E14")) }
+                      fun push() { pv.invalidate(); if (p.getBoolean("ch_on", false)) startService(Intent(ctx, CrosshairService::class.java)) }
+                      addView(Switch(ctx).apply {
+                          text = "Aktifkan crosshair"; setTextColor(TX); textSize = 17f; isChecked = p.getBoolean("ch_on", false)
+                          setOnCheckedChangeListener { _, on ->
+                              if (on) {
+                                  if (!Settings.canDrawOverlays(ctx)) {
+                                      isChecked = false
+                                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                                      toast("Izinkan 'Tampil di atas aplikasi lain', lalu kembali ke sini")
+                                      return@setOnCheckedChangeListener
+                                  }
+                                  p.edit().putBoolean("ch_on", true).apply()
+                                  startService(Intent(ctx, CrosshairService::class.java))
+                              } else {
+                                  p.edit().putBoolean("ch_on", false).apply()
+                                  stopService(Intent(ctx, CrosshairService::class.java))
+                              }
+                          }
+                      }, lp(top = 16))
+                      addView(pv, lp(h = dp(110), top = 14))
+                      addView(tv("Bentuk", 13f, MUT), lp(top = 14))
+                      addView(row(*listOf("Titik", "Plus", "Lingkaran", "X").mapIndexed { i, s ->
+                          button(s) { p.edit().putInt("ch_style", i).apply(); push() } }.toTypedArray()), lp(top = 6))
+                      addView(tv("Warna", 13f, MUT), lp(top = 14))
+                      val cols = listOf("#FF0000", "#00FF00", "#FFFFFF", "#00FFFF", "#FFFF00", "#FF00FF")
+                      addView(row(*cols.mapIndexed { i, c ->
+                          Button(ctx).apply { background = bg(Color.parseColor(c), 12); setOnClickListener { p.edit().putInt("ch_color", i).apply(); push() } } as View
+                      }.toTypedArray()), lp(top = 6))
+                      fun slider(label: String, key: String, max: Int, def: Int, off: Int = 0) {
+                          val t = tv("$label: ${p.getInt(key, def)}", 13f, MUT)
+                          addView(t, lp(top = 14))
+                          addView(seek(max, p.getInt(key, def) - off) { v ->
+                              p.edit().putInt(key, v + off).apply(); t.text = "$label: ${v + off}"; push() }, lp())
+                      }
+                      slider("Ukuran", "ch_size", 60, 14)
+                      slider("Ketebalan", "ch_thick", 8, 2)
+                      slider("Transparansi (%)", "ch_alpha", 100, 100)
+                      slider("Geser horizontal", "ch_x", 200, 0, -100)
+                      slider("Geser vertikal", "ch_y", 200, 0, -100)
+                      addView(tv("Titik tengah layar = posisi 0. Overlay tidak menghalangi sentuhan ke game.", 12f, MUT), lp(top = 14))
+                  }
+              }
+          }
+          EOF_FILE
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameTuner-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
