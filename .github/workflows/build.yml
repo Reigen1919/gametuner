@@ -575,7 +575,7 @@ jobs:
           EOF_FILE
 
       - name: Build
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleDebug --no-daemon -Pandroid.useAndroidX=true
       - uses: actions/upload-artifact@v4
         with:
           name: GameTuner-apk
